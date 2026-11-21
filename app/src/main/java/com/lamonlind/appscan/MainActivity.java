@@ -2,43 +2,42 @@ package com.lamonlind.appscan;
 
 import android.app.Activity;
 import android.content.Intent;
-import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
-import android.text.Spannable;
-import android.text.SpannableString;
-import android.text.Spanned;
-import android.text.style.ForegroundColorSpan;
 import android.view.View;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.util.Locale;
 
 public class MainActivity extends Activity {
     private static final int REQUEST_INPUT = 1001;
     private static final int REQUEST_OUTPUT = 1002;
-    private static final int MAX_LINES = 500;
 
     private EditText inputText;
     private EditText portsText;
     private EditText threadsText;
     private EditText outputName;
+    private EditText saveServer;
+    private CheckBox saveHostsOnly;
     private TextView progress;
-    private TextView results;
+    private TextView serverSummary;
+    private TextView statusSummary;
     private Button start;
     private Button stop;
     private Button test;
@@ -46,7 +45,12 @@ public class MainActivity extends Activity {
     private Uri inputUri;
     private Uri outputUri;
     private ScanController controller;
-    private final ArrayList<String> passedHosts = new ArrayList<String>();
+    private boolean pendingStart;
+    private List<String> pendingHosts;
+    private List<Integer> pendingPorts;
+    private int pendingThreads;
+    private Ipv4Cidr pendingCidr;
+    private long pendingHostCount;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -57,8 +61,11 @@ public class MainActivity extends Activity {
         portsText = findViewById(R.id.ports);
         threadsText = findViewById(R.id.threads);
         outputName = findViewById(R.id.outputName);
+        saveServer = findViewById(R.id.saveServer);
+        saveHostsOnly = findViewById(R.id.saveHostsOnly);
         progress = findViewById(R.id.progress);
-        results = findViewById(R.id.results);
+        serverSummary = findViewById(R.id.serverSummary);
+        statusSummary = findViewById(R.id.statusSummary);
         start = findViewById(R.id.start);
         stop = findViewById(R.id.stop);
         test = findViewById(R.id.test);
@@ -95,9 +102,7 @@ public class MainActivity extends Activity {
     }
 
     private void beginScan() {
-        if (controller != null) {
-            controller.stop();
-        }
+        if (controller != null) controller.stop();
 
         List<Integer> ports;
         int threads;
@@ -135,47 +140,18 @@ public class MainActivity extends Activity {
             }
         }
 
-        passedHosts.clear();
-        results.setText("  Method  Code  Server  Port  Host");
-        progress.setText("Done 0 / 0");
-        start.setEnabled(false);
-        stop.setEnabled(true);
+        pendingHosts = hosts;
+        pendingPorts = ports;
+        pendingThreads = threads;
+        pendingCidr = cidr;
+        pendingHostCount = hostCount;
+        pendingStart = true;
 
-        controller = new ScanController(new ScanController.Callback() {
-            @Override
-            public void onProgress(long done, long total, long sent, long responded,
-                                   long failed, long skipped, double requestsPerSecond) {
-                progress.setText("Done " + done + " / " + total
-                        + " | sent " + sent
-                        + " | responded " + responded
-                        + " | failed " + failed
-                        + " | skipped " + skipped
-                        + " | " + String.format(java.util.Locale.US, "%.1f", requestsPerSecond) + " req/s");
-            }
-
-            @Override
-            public void onHit(String method, int code, String server, int port,
-                              String host, String location) {
-                appendHit(method, code, server, port, host, location);
-            }
-
-            @Override
-            public void onFinished(List<String> passed) {
-                passedHosts.clear();
-                passedHosts.addAll(passed);
-                start.setEnabled(true);
-                stop.setEnabled(false);
-                progress.append(" - finished");
-                requestOutputDocument();
-            }
-
-            @Override
-            public void onError(String message) {
-                Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
-            }
-        });
-
-        controller.start(hosts, ports, threads, cidr, hostCount);
+        if (outputUri == null) {
+            requestOutputDocument();
+        } else {
+            startController();
+        }
     }
 
     private ArrayList<Integer> parsePorts(String text) {
@@ -208,39 +184,6 @@ public class MainActivity extends Activity {
         return result;
     }
 
-    private void appendHit(String method, int code, String server, int port,
-                           String host, String location) {
-        String line = "  " + method + "  " + code + "  " + server + "  " + port + "  " + host;
-        if (location != null && !location.isEmpty()) line += " -> " + location;
-        line += "\n";
-
-        String text = results.getText().toString();
-        String[] lines = text.split("\n", -1);
-        if (lines.length >= MAX_LINES) {
-            StringBuilder sb = new StringBuilder();
-            sb.append(lines[0]).append('\n');
-            int start = lines.length - MAX_LINES + 2;
-            for (int i = start; i < lines.length; i++) {
-                if (!lines[i].isEmpty()) sb.append(lines[i]).append('\n');
-            }
-            results.setText(sb.toString());
-        }
-
-        SpannableString span = new SpannableString(line);
-        if ("Varnish".equals(server) && code == 500) {
-            span.setSpan(new ForegroundColorSpan(Color.rgb(0, 160, 0)), 0, line.length(),
-                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
-        }
-        results.append(span);
-        final ScrollView scroll = (ScrollView) results.getParent();
-        scroll.post(new Runnable() {
-            @Override
-            public void run() {
-                scroll.fullScroll(View.FOCUS_DOWN);
-            }
-        });
-    }
-
     private void requestOutputDocument() {
         String name = outputName.getText().toString().trim();
         name = name.replace('/', '_').replace('\n', '_');
@@ -254,9 +197,72 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, REQUEST_OUTPUT);
     }
 
+    private void startController() {
+        if (!pendingStart) return;
+        BufferedWriter writer = openOutputWriter();
+        if (writer == null) {
+            pendingStart = false;
+            Toast.makeText(this, "Could not open output file", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        pendingStart = false;
+        progress.setText("Done 0 / " + (pendingCidr != null
+                ? pendingHostCount * pendingPorts.size()
+                : (long) pendingHosts.size() * pendingPorts.size()));
+        serverSummary.setText("no servers");
+        statusSummary.setText("no status codes");
+        start.setEnabled(false);
+        stop.setEnabled(true);
+
+        controller = new ScanController(new ScanController.Callback() {
+            @Override
+            public void onProgress(long done, long total, long sent, long responded,
+                                   long failed, long skipped, double requestsPerSecond,
+                                   String servers, String statuses) {
+                progress.setText("Done " + done + " / " + total
+                        + " | sent " + sent
+                        + " | responded " + responded
+                        + " | failed " + failed
+                        + " | skipped " + skipped
+                        + " | " + String.format(Locale.US, "%.1f", requestsPerSecond) + " req/s");
+                serverSummary.setText(servers);
+                statusSummary.setText(statuses);
+            }
+
+            @Override
+            public void onFinished() {
+                start.setEnabled(true);
+                stop.setEnabled(false);
+                progress.append(" - finished");
+                Toast.makeText(MainActivity.this, "Scan finished", Toast.LENGTH_SHORT).show();
+            }
+
+            @Override
+            public void onError(String message) {
+                Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        String server = saveServer.getText().toString().trim();
+        controller.start(pendingHosts, pendingPorts, pendingThreads, pendingCidr,
+                pendingHostCount, writer, saveHostsOnly.isChecked(), server);
+    }
+
+    private BufferedWriter openOutputWriter() {
+        if (outputUri == null) return null;
+        try {
+            OutputStream stream = getContentResolver().openOutputStream(outputUri, "wt");
+            if (stream == null) return null;
+            return new BufferedWriter(new OutputStreamWriter(stream, StandardCharsets.UTF_8), 8192);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private void runSelfTest() {
         test.setEnabled(false);
-        results.setText("Testing http://1.1.1.1 ...");
+        progress.setText("Testing http://1.1.1.1 ...");
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -273,7 +279,7 @@ public class MainActivity extends Activity {
                     int code = connection.getResponseCode();
                     String server = connection.getHeaderField("Server");
                     result = "Status: " + code + " | Server: "
-                            + (server == null || server.isEmpty() ? "(none)" : server);
+                            + (server == null || server.trim().isEmpty() ? "unknown" : server.trim());
                 } catch (Exception e) {
                     String message = e.getMessage();
                     result = "Exception: " + e.getClass().getName()
@@ -285,7 +291,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        results.setText(displayResult);
+                        progress.setText(displayResult);
                         test.setEnabled(true);
                     }
                 });
@@ -310,24 +316,12 @@ public class MainActivity extends Activity {
             }
         } else if (requestCode == REQUEST_OUTPUT) {
             outputUri = uri;
-            writeOutput(uri);
-        }
-    }
-
-    private void writeOutput(Uri uri) {
-        try {
-            OutputStream stream = getContentResolver().openOutputStream(uri, "wt");
-            if (stream == null) return;
-            OutputStreamWriter writer = new OutputStreamWriter(stream, StandardCharsets.UTF_8);
-            for (String host : passedHosts) {
-                writer.write(host);
-                writer.write('\n');
+            try {
+                getContentResolver().takePersistableUriPermission(
+                        uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            } catch (SecurityException ignored) {
             }
-            writer.flush();
-            writer.close();
-            Toast.makeText(this, "Output saved", Toast.LENGTH_SHORT).show();
-        } catch (IOException e) {
-            Toast.makeText(this, "Could not save output", Toast.LENGTH_SHORT).show();
+            if (pendingStart) startController();
         }
     }
 
