@@ -1,9 +1,19 @@
 package com.lamonlind.appscan;
 
 import android.app.Activity;
+import android.content.ComponentName;
+import android.content.Context;
 import android.content.Intent;
+import android.content.ServiceConnection;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.View;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -12,12 +22,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -28,6 +35,7 @@ import java.util.Locale;
 public class MainActivity extends Activity {
     private static final int REQUEST_INPUT = 1001;
     private static final int REQUEST_OUTPUT = 1002;
+    private static final int REQUEST_NOTIFICATIONS = 1003;
 
     private EditText inputText;
     private EditText portsText;
@@ -41,16 +49,38 @@ public class MainActivity extends Activity {
     private Button start;
     private Button stop;
     private Button test;
+    private Button resume;
 
     private Uri inputUri;
     private Uri outputUri;
-    private ScanController controller;
     private boolean pendingStart;
-    private List<String> pendingHosts;
-    private List<Integer> pendingPorts;
-    private int pendingThreads;
-    private Ipv4Cidr pendingCidr;
-    private long pendingHostCount;
+
+    private boolean bound;
+    private ScanService scanService;
+    private final Handler handler = new Handler();
+
+    private final ServiceConnection connection = new ServiceConnection() {
+        @Override
+        public void onServiceConnected(ComponentName name, IBinder binder) {
+            scanService = ((ScanService.LocalBinder) binder).getService();
+            bound = true;
+            updateUiFromService();
+        }
+
+        @Override
+        public void onServiceDisconnected(ComponentName name) {
+            bound = false;
+            scanService = null;
+        }
+    };
+
+    private final Runnable uiTicker = new Runnable() {
+        @Override
+        public void run() {
+            updateUiFromService();
+            handler.postDelayed(this, 500);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -69,6 +99,7 @@ public class MainActivity extends Activity {
         start = findViewById(R.id.start);
         stop = findViewById(R.id.stop);
         test = findViewById(R.id.test);
+        resume = findViewById(R.id.resume);
 
         findViewById(R.id.chooseFile).setOnClickListener(new View.OnClickListener() {
             @Override
@@ -89,8 +120,7 @@ public class MainActivity extends Activity {
         stop.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
-                if (controller != null) controller.stop();
-                stop.setEnabled(false);
+                startService(newIntent(ScanService.ACTION_STOP));
             }
         });
         test.setOnClickListener(new View.OnClickListener() {
@@ -99,11 +129,53 @@ public class MainActivity extends Activity {
                 runSelfTest();
             }
         });
+        resume.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                resumeSavedScan();
+            }
+        });
+        findViewById(R.id.battery).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                openBatteryOptimizationSettings();
+            }
+        });
+
+        requestNotificationPermission();
+        updateResumeAvailability();
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        Intent intent = new Intent(this, ScanService.class);
+        bindService(intent, connection, BIND_AUTO_CREATE);
+        handler.removeCallbacks(uiTicker);
+        handler.post(uiTicker);
+    }
+
+    @Override
+    protected void onStop() {
+        handler.removeCallbacks(uiTicker);
+        if (bound) {
+            unbindService(connection);
+            bound = false;
+            scanService = null;
+        }
+        super.onStop();
+    }
+
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS")
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"},
+                    REQUEST_NOTIFICATIONS);
+        }
     }
 
     private void beginScan() {
-        if (controller != null) controller.stop();
-
         List<Integer> ports;
         int threads;
         try {
@@ -115,73 +187,61 @@ public class MainActivity extends Activity {
             return;
         }
 
-        ArrayList<String> hosts = new ArrayList<String>();
-        Ipv4Cidr cidr = null;
-        long hostCount = 0;
-
-        if (inputUri != null) {
-            hosts = readHostFile(inputUri);
-            if (hosts.isEmpty()) {
-                Toast.makeText(this, "Host file is empty", Toast.LENGTH_SHORT).show();
-                return;
-            }
-        } else {
-            String input = inputText.getText().toString().trim();
-            if (input.isEmpty()) {
-                Toast.makeText(this, "Choose a host file or enter an IPv4 CIDR", Toast.LENGTH_SHORT).show();
+        String cidrText = "";
+        if (inputUri == null) {
+            cidrText = inputText.getText().toString().trim();
+            if (cidrText.isEmpty()) {
+                Toast.makeText(this, "Choose a host file or enter an IPv4 CIDR",
+                        Toast.LENGTH_SHORT).show();
                 return;
             }
             try {
-                cidr = Ipv4Cidr.parse(input);
-                hostCount = cidr.count;
+                Ipv4Cidr.parse(cidrText);
             } catch (IllegalArgumentException e) {
-                Toast.makeText(this, "Invalid CIDR (or choose a host file)", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Invalid CIDR (or choose a host file)",
+                        Toast.LENGTH_SHORT).show();
                 return;
             }
         }
 
-        pendingHosts = hosts;
-        pendingPorts = ports;
-        pendingThreads = threads;
-        pendingCidr = cidr;
-        pendingHostCount = hostCount;
-        pendingStart = true;
-
         if (outputUri == null) {
+            pendingStart = true;
             requestOutputDocument();
         } else {
-            startController();
+            startServiceScan(cidrText, joinPorts(ports), threads, 0);
         }
     }
 
-    private ArrayList<Integer> parsePorts(String text) {
-        ArrayList<Integer> result = new ArrayList<Integer>();
-        if (text == null || text.trim().isEmpty()) text = "80";
-        for (String item : text.split(",")) {
-            int port = Integer.parseInt(item.trim());
-            if (port < 1 || port > 65535) throw new NumberFormatException();
-            if (!result.contains(port)) result.add(port);
+    private void startServiceScan(String cidrText, String portsTextValue,
+                                  int threadsValue, long hostIndex) {
+        pendingStart = false;
+        Intent intent = newIntent(ScanService.ACTION_START);
+        intent.putExtra(ScanService.PREF_CIDR, cidrText);
+        intent.putExtra(ScanService.PREF_INPUT_URI,
+                inputUri == null ? "" : inputUri.toString());
+        intent.putExtra(ScanService.PREF_OUTPUT_URI,
+                outputUri == null ? "" : outputUri.toString());
+        intent.putExtra(ScanService.PREF_PORTS, portsTextValue);
+        intent.putExtra(ScanService.PREF_THREADS, threadsValue);
+        intent.putExtra(ScanService.PREF_HOSTS_ONLY, saveHostsOnly.isChecked());
+        intent.putExtra(ScanService.PREF_SERVER,
+                saveServer.getText().toString().trim());
+        intent.putExtra(ScanService.PREF_HOST_INDEX, hostIndex);
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
         }
-        if (result.isEmpty()) throw new NumberFormatException();
-        return result;
+        start.setEnabled(false);
+        stop.setEnabled(true);
+        resume.setEnabled(false);
     }
 
-    private ArrayList<String> readHostFile(Uri uri) {
-        ArrayList<String> result = new ArrayList<String>();
-        try {
-            InputStream stream = getContentResolver().openInputStream(uri);
-            if (stream == null) return result;
-            BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (!line.isEmpty()) result.add(line);
-            }
-            reader.close();
-        } catch (IOException e) {
-            Toast.makeText(this, "Could not read host file", Toast.LENGTH_SHORT).show();
-        }
-        return result;
+    private Intent newIntent(String action) {
+        Intent intent = new Intent(this, ScanService.class);
+        intent.setAction(action);
+        return intent;
     }
 
     private void requestOutputDocument() {
@@ -197,67 +257,89 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, REQUEST_OUTPUT);
     }
 
-    private void startController() {
-        if (!pendingStart) return;
-        BufferedWriter writer = openOutputWriter();
-        if (writer == null) {
-            pendingStart = false;
-            Toast.makeText(this, "Could not open output file", Toast.LENGTH_SHORT).show();
-            return;
+    private ArrayList<Integer> parsePorts(String text) {
+        ArrayList<Integer> result = new ArrayList<Integer>();
+        if (text == null || text.trim().isEmpty()) text = "80";
+        for (String item : text.split(",")) {
+            int port = Integer.parseInt(item.trim());
+            if (port < 1 || port > 65535) throw new NumberFormatException();
+            if (!result.contains(port)) result.add(port);
         }
-
-        pendingStart = false;
-        progress.setText("Done 0 / " + (pendingCidr != null
-                ? pendingHostCount * pendingPorts.size()
-                : (long) pendingHosts.size() * pendingPorts.size()));
-        serverSummary.setText("no servers");
-        statusSummary.setText("no status codes");
-        start.setEnabled(false);
-        stop.setEnabled(true);
-
-        controller = new ScanController(new ScanController.Callback() {
-            @Override
-            public void onProgress(long done, long total, long sent, long responded,
-                                   long failed, long skipped, double requestsPerSecond,
-                                   String servers, String statuses) {
-                progress.setText("Done " + done + " / " + total
-                        + " | sent " + sent
-                        + " | responded " + responded
-                        + " | failed " + failed
-                        + " | skipped " + skipped
-                        + " | " + String.format(Locale.US, "%.1f", requestsPerSecond) + " req/s");
-                serverSummary.setText(servers);
-                statusSummary.setText(statuses);
-            }
-
-            @Override
-            public void onFinished() {
-                start.setEnabled(true);
-                stop.setEnabled(false);
-                progress.append(" - finished");
-                Toast.makeText(MainActivity.this, "Scan finished", Toast.LENGTH_SHORT).show();
-            }
-
-            @Override
-            public void onError(String message) {
-                Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
-            }
-        });
-
-        String server = saveServer.getText().toString().trim();
-        controller.start(pendingHosts, pendingPorts, pendingThreads, pendingCidr,
-                pendingHostCount, writer, saveHostsOnly.isChecked(), server);
+        if (result.isEmpty()) throw new NumberFormatException();
+        return result;
     }
 
-    private BufferedWriter openOutputWriter() {
-        if (outputUri == null) return null;
-        try {
-            OutputStream stream = getContentResolver().openOutputStream(outputUri, "wt");
-            if (stream == null) return null;
-            return new BufferedWriter(new OutputStreamWriter(stream, StandardCharsets.UTF_8), 8192);
-        } catch (IOException e) {
-            return null;
+    private String joinPorts(List<Integer> ports) {
+        StringBuilder result = new StringBuilder();
+        for (Integer port : ports) {
+            if (result.length() > 0) result.append(',');
+            result.append(port);
         }
+        return result.toString();
+    }
+
+    private void updateResumeAvailability() {
+        SharedPreferences prefs =
+                getSharedPreferences(ScanService.PREFS_NAME, MODE_PRIVATE);
+        long done = prefs.getLong(ScanService.PREF_DONE, 0);
+        long total = prefs.getLong(ScanService.PREF_TOTAL, 0);
+        String output = prefs.getString(ScanService.PREF_OUTPUT_URI, "");
+        resume.setEnabled(output.length() > 0 && done < total);
+    }
+
+    private void resumeSavedScan() {
+        SharedPreferences prefs =
+                getSharedPreferences(ScanService.PREFS_NAME, MODE_PRIVATE);
+        String cidrText = prefs.getString(ScanService.PREF_CIDR, "");
+        String inputUriText = prefs.getString(ScanService.PREF_INPUT_URI, "");
+        String outputUriText = prefs.getString(ScanService.PREF_OUTPUT_URI, "");
+        String portsTextValue = prefs.getString(ScanService.PREF_PORTS, "80");
+        int threadsValue = prefs.getInt(ScanService.PREF_THREADS, 40);
+        long hostIndex = prefs.getLong(ScanService.PREF_HOST_INDEX, 0);
+
+        inputUri = inputUriText.isEmpty() ? null : Uri.parse(inputUriText);
+        outputUri = outputUriText.isEmpty() ? null : Uri.parse(outputUriText);
+        portsText.setText(portsTextValue);
+        threadsText.setText(Integer.toString(threadsValue));
+        saveHostsOnly.setChecked(prefs.getBoolean(
+                ScanService.PREF_HOSTS_ONLY, false));
+        saveServer.setText(prefs.getString(ScanService.PREF_SERVER, "all"));
+        if (inputUri == null) inputText.setText(cidrText);
+        else inputText.setText(inputUri.getLastPathSegment());
+
+        startServiceScan(cidrText, portsTextValue, threadsValue, hostIndex);
+    }
+
+    private void openBatteryOptimizationSettings() {
+        Intent intent = new Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:" + getPackageName()));
+        if (intent.resolveActivity(getPackageManager()) != null) {
+            startActivity(intent);
+        } else {
+            Intent fallback = new Intent(
+                    Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS);
+            startActivity(fallback);
+        }
+    }
+
+    private void updateUiFromService() {
+        if (scanService == null) {
+            updateResumeAvailability();
+            return;
+        }
+        long done = scanService.getDone();
+        long total = scanService.getTotal();
+        double rps = scanService.getRequestsPerSecond();
+        progress.setText("Done " + done + " / " + total
+                + " | " + String.format(Locale.US, "%.1f", rps) + " req/s");
+        serverSummary.setText(scanService.getServerSummary());
+        statusSummary.setText(scanService.getStatusSummary());
+
+        boolean scanning = scanService.isScanning();
+        start.setEnabled(!scanning);
+        stop.setEnabled(scanning);
+        updateResumeAvailability();
     }
 
     private void runSelfTest() {
@@ -279,7 +361,8 @@ public class MainActivity extends Activity {
                     int code = connection.getResponseCode();
                     String server = connection.getHeaderField("Server");
                     result = "Status: " + code + " | Server: "
-                            + (server == null || server.trim().isEmpty() ? "unknown" : server.trim());
+                            + (server == null || server.trim().isEmpty()
+                            ? "unknown" : server.trim());
                 } catch (Exception e) {
                     String message = e.getMessage();
                     result = "Exception: " + e.getClass().getName()
@@ -303,9 +386,9 @@ public class MainActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != Activity.RESULT_OK || data == null) return;
-
         Uri uri = data.getData();
         if (uri == null) return;
+
         if (requestCode == REQUEST_INPUT) {
             inputUri = uri;
             inputText.setText(uri.getLastPathSegment());
@@ -321,13 +404,9 @@ public class MainActivity extends Activity {
                         uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
             } catch (SecurityException ignored) {
             }
-            if (pendingStart) startController();
+            if (pendingStart) {
+                beginScan();
+            }
         }
-    }
-
-    @Override
-    protected void onDestroy() {
-        if (!isChangingConfigurations() && controller != null) controller.stop();
-        super.onDestroy();
     }
 }

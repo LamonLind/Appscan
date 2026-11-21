@@ -15,4 +15,4 @@ Native Android app that scans an IPv4 CIDR or a text host-file with HEAD request
    git push -u origin main
    ```
 3. Open the repository's **Actions** tab and open the latest **Android release** run.
-4. Download **app-release** from the run's Artifacts section. The APK is rejected by the workflow if it exceeds 2 MB (2,097,152 bytes).
+4. Download **app-release** from the run’s Artifacts section. The APK is rejected by the workflow if it exceeds 3 MB (3,145,728 bytes).

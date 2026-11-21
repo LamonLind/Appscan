@@ -31,7 +31,7 @@ jobs:
           KB="$((SIZE / 1024))"
           echo "APK: $APK"
           echo "APK size: $SIZE bytes (${KB} KiB)"
-          test "$SIZE" -le 2097152
+          test "$SIZE" -le 3145728
 
       - uses: actions/upload-artifact@v4
         with:

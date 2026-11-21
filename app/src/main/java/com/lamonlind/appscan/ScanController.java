@@ -56,6 +56,7 @@ final class ScanController {
     private volatile long total;
     private volatile long startedAtNanos;
     private volatile Thread producerThread;
+    private volatile long currentHostIndex;
 
     private final Runnable progressTicker = new Runnable() {
         @Override
@@ -73,9 +74,17 @@ final class ScanController {
     void start(List<String> hosts, List<Integer> ports, int threads,
                Ipv4Cidr cidr, long hostCount, BufferedWriter writer,
                boolean saveHostsOnly, String saveServer) {
+        start(hosts, ports, threads, cidr, hostCount, writer, saveHostsOnly,
+                saveServer, 0);
+    }
+
+    void start(List<String> hosts, List<Integer> ports, int threads,
+               Ipv4Cidr cidr, long hostCount, BufferedWriter writer,
+               boolean saveHostsOnly, String saveServer, long hostStartIndex) {
         stopping.set(false);
         finished.set(false);
-        done.set(0);
+        currentHostIndex = Math.max(0, hostStartIndex);
+        done.set(currentHostIndex * ports.size());
         sent.set(0);
         responded.set(0);
         failed.set(0);
@@ -114,10 +123,15 @@ final class ScanController {
     }
 
     private void submitHosts(List<String> hosts, List<Integer> ports) {
-        for (String host : hosts) {
+        for (int i = (int) Math.min(currentHostIndex, hosts.size()); i < hosts.size(); i++) {
             if (stopping.get()) break;
+            String host = hosts.get(i);
             host = host.trim();
-            if (host.isEmpty()) continue;
+            currentHostIndex = i + 1;
+            if (host.isEmpty()) {
+                done.addAndGet(ports.size());
+                continue;
+            }
             for (Integer port : ports) {
                 if (stopping.get()) break;
                 submitTask(host, port);
@@ -126,7 +140,9 @@ final class ScanController {
     }
 
     private void submitCidr(Ipv4Cidr cidr, List<Integer> ports) {
-        for (long i = 0; i < cidr.count && !stopping.get(); i++) {
+        long start = Math.min(currentHostIndex, cidr.count);
+        for (long i = start; i < cidr.count && !stopping.get(); i++) {
+            currentHostIndex = i + 1;
             String host = Ipv4Cidr.format(cidr.first + i);
             for (Integer port : ports) {
                 if (stopping.get()) break;
@@ -396,5 +412,13 @@ final class ScanController {
         Thread producer = producerThread;
         if (producer != null) producer.interrupt();
         flushAndClose();
+    }
+
+    long getDone() {
+        return done.get();
+    }
+
+    long getCurrentHostIndex() {
+        return currentHostIndex;
     }
 }
