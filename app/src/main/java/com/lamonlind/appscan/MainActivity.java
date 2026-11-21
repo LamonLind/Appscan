@@ -281,10 +281,11 @@ public class MainActivity extends Activity {
                 } finally {
                     if (connection != null) connection.disconnect();
                 }
+                final String displayResult = result;
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        results.setText(result);
+                        results.setText(displayResult);
                         test.setEnabled(true);
                     }
                 });
