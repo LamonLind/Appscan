@@ -25,6 +25,8 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.net.HttpURLConnection;
+import java.net.URL;
 
 public class MainActivity extends Activity {
     private static final int REQUEST_INPUT = 1001;
@@ -39,6 +41,7 @@ public class MainActivity extends Activity {
     private TextView results;
     private Button start;
     private Button stop;
+    private Button test;
 
     private Uri inputUri;
     private Uri outputUri;
@@ -58,6 +61,7 @@ public class MainActivity extends Activity {
         results = findViewById(R.id.results);
         start = findViewById(R.id.start);
         stop = findViewById(R.id.stop);
+        test = findViewById(R.id.test);
 
         findViewById(R.id.chooseFile).setOnClickListener(new View.OnClickListener() {
             @Override
@@ -82,6 +86,12 @@ public class MainActivity extends Activity {
                 stop.setEnabled(false);
             }
         });
+        test.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                runSelfTest();
+            }
+        });
     }
 
     private void beginScan() {
@@ -95,7 +105,6 @@ public class MainActivity extends Activity {
             ports = parsePorts(portsText.getText().toString());
             threads = Integer.parseInt(threadsText.getText().toString().trim());
             if (threads < 1) throw new NumberFormatException();
-            if (threads > 500) threads = 500;
         } catch (Exception e) {
             Toast.makeText(this, "Invalid ports or thread count", Toast.LENGTH_SHORT).show();
             return;
@@ -134,8 +143,14 @@ public class MainActivity extends Activity {
 
         controller = new ScanController(new ScanController.Callback() {
             @Override
-            public void onProgress(long done, long total) {
-                progress.setText("Done " + done + " / " + total);
+            public void onProgress(long done, long total, long sent, long responded,
+                                   long failed, long skipped, double requestsPerSecond) {
+                progress.setText("Done " + done + " / " + total
+                        + " | sent " + sent
+                        + " | responded " + responded
+                        + " | failed " + failed
+                        + " | skipped " + skipped
+                        + " | " + String.format(java.util.Locale.US, "%.1f", requestsPerSecond) + " req/s");
             }
 
             @Override
@@ -237,6 +252,44 @@ public class MainActivity extends Activity {
         intent.setType("text/plain");
         intent.putExtra(Intent.EXTRA_TITLE, name);
         startActivityForResult(intent, REQUEST_OUTPUT);
+    }
+
+    private void runSelfTest() {
+        test.setEnabled(false);
+        results.setText("Testing http://1.1.1.1 ...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                HttpURLConnection connection = null;
+                String result;
+                try {
+                    URL url = new URL("http://1.1.1.1");
+                    connection = (HttpURLConnection) url.openConnection();
+                    connection.setInstanceFollowRedirects(false);
+                    connection.setRequestMethod("HEAD");
+                    connection.setConnectTimeout(1000);
+                    connection.setReadTimeout(1000);
+                    connection.setUseCaches(false);
+                    int code = connection.getResponseCode();
+                    String server = connection.getHeaderField("Server");
+                    result = "Status: " + code + " | Server: "
+                            + (server == null || server.isEmpty() ? "(none)" : server);
+                } catch (Exception e) {
+                    String message = e.getMessage();
+                    result = "Exception: " + e.getClass().getName()
+                            + (message == null || message.isEmpty() ? "" : ": " + message);
+                } finally {
+                    if (connection != null) connection.disconnect();
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        results.setText(result);
+                        test.setEnabled(true);
+                    }
+                });
+            }
+        }, "appscan-self-test").start();
     }
 
     @Override
