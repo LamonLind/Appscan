@@ -261,7 +261,7 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 HttpURLConnection connection = null;
-                final String result;
+                String result;
                 try {
                     URL url = new URL("http://1.1.1.1");
                     connection = (HttpURLConnection) url.openConnection();
